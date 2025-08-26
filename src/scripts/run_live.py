@@ -6,7 +6,7 @@ import logging
 import sys
 import time
 from typing import Optional, Tuple
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 
 import MetaTrader5 as mt5
 import pandas as pd
@@ -20,6 +20,47 @@ from risk.position_sizing import calc_volume_for_risk
 
 
 # ---------------------- Utils ----------------------
+
+def _server_now(symbol: str) -> datetime:
+    """
+    Returner meglerens servertid basert på siste tick fra symbolet.
+    Faller tilbake til lokal tid hvis tick mangler.
+    """
+    tick = mt5.symbol_info_tick(symbol)
+    if tick and getattr(tick, "time", None):
+        # MT5-tid er epoch sekunder (UTC). Konverter til naive lokal dt for konsekvent bruk.
+        return datetime.fromtimestamp(int(tick.time))
+    return datetime.now()
+
+def realized_pnl_today_server(symbol: str) -> float:
+    """
+    Realisert PnL for inneværende kalenderdag etter MEGLERENS servertid.
+    Summerer profit + swap + commission fra dagens midnatt (server) til nå.
+    Restart-sikkert.
+    """
+    now_srv = _server_now(symbol)
+    day_start_srv = now_srv.replace(hour=0, minute=0, second=0, microsecond=0)
+    deals = None
+    # Prøv direkte intervall først
+    try:
+        deals = mt5.history_deals_get(day_start_srv, now_srv)
+    except Exception:
+        deals = None
+    # Fallback: history_select hvis tilgjengelig
+    if deals is None and hasattr(mt5, "history_select"):
+        try:
+            if mt5.history_select(day_start_srv, now_srv):
+                deals = mt5.history_deals_get()
+        except Exception:
+            deals = None
+    if deals is None:
+        return 0.0
+    total = 0.0
+    for d in deals:
+        total += float(getattr(d, "profit", 0.0))
+        total += float(getattr(d, "swap", 0.0))
+        total += float(getattr(d, "commission", 0.0))
+    return total
 
 def resolve_symbol(cli_symbol: Optional[str], strategy_obj) -> str:
     log = logging.getLogger("runner")
@@ -279,45 +320,63 @@ def current_portfolio_risk_percent() -> float:
 
 class DailyLossGuard:
     def __init__(self, max_loss_pct: float, max_loss_money: float):
-        self.max_loss_pct = float(max_loss_pct or 0.0)   # 0 = av
+        self.max_loss_pct = float(max_loss_pct or 0.0)    # 0 = av
         self.max_loss_money = float(max_loss_money or 0.0)
-        self.day: date = date.today()
-        ai = mt5.account_info()
-        self.start_equity: float = float(ai.equity) if ai and ai.equity else 0.0
         self.locked_for_today: bool = False
+        self._announced: bool = False
+        self._lock_day_key: Optional[str] = None  # "YYYY-MM-DD" for server-dato når låst
 
-    def _reset_if_new_day(self):
-        today = date.today()
-        if today != self.day:
-            ai = mt5.account_info()
-            self.day = today
-            self.start_equity = float(ai.equity) if ai and ai.equity else 0.0
+    def _server_day_key(self, symbol: str) -> str:
+        dt = _server_now(symbol)
+        return dt.strftime("%Y-%m-%d")
+
+    def _reset_if_new_server_day(self, symbol: str):
+        key = self._server_day_key(symbol)
+        if self._lock_day_key and self._lock_day_key != key:
+            # Ny dag på server -> lås opp
             self.locked_for_today = False
-            logging.getLogger("runner").info("📆 Ny dag: baseline equity satt til %.2f", self.start_equity)
+            self._announced = False
+            self._lock_day_key = None
+            logging.getLogger("runner").info("📆 Ny server-dag: daily-loss reset.")
 
-    def should_block_new_trades(self) -> bool:
-        self._reset_if_new_day()
+    def should_block_new_trades(self, symbol: str) -> bool:
+        """
+        Lås når realisert PnL i dag (server-døgn) ≤ -terskel.
+        Terskel = max( max_loss_money, equity * max_loss_pct/100 ).
+        """
+        self._reset_if_new_server_day(symbol)
         if self.locked_for_today:
             return True
-        ai = mt5.account_info()
-        if not ai or not ai.equity:
-            return False
-        current_eq = float(ai.equity)
-        dd_money = max(0.0, self.start_equity - current_eq)
-        dd_pct = (dd_money / self.start_equity * 100.0) if self.start_equity > 0 else 0.0
 
-        over_money = self.max_loss_money > 0.0 and dd_money >= self.max_loss_money
-        over_pct = self.max_loss_pct > 0.0 and dd_pct >= self.max_loss_pct
-        if over_money or over_pct:
-            self.locked_for_today = True
+        # Hvis begge grenser er av -> ingen lås
+        if self.max_loss_pct <= 0.0 and self.max_loss_money <= 0.0:
+            return False
+
+        ai = mt5.account_info()
+        equity = float(ai.equity) if ai and ai.equity else 0.0
+        pnl_today = realized_pnl_today_server(symbol)  # negativ ved tap
+        dd_money = -pnl_today if pnl_today < 0 else 0.0
+
+        # Beregn terskel i penger
+        threshold_money = 0.0
+        if self.max_loss_money > 0.0:
+            threshold_money = max(threshold_money, self.max_loss_money)
+        if self.max_loss_pct > 0.0 and equity > 0.0:
+            threshold_money = max(threshold_money, equity * (self.max_loss_pct / 100.0))
+
+        if threshold_money > 0.0 and dd_money >= threshold_money:
+            dd_pct = (dd_money / equity * 100.0) if equity > 0 else 0.0
             logging.getLogger("runner").warning(
-                "⛔ Max daily loss truffet: drawdown=%.2f (%.2f%%) | grenser: money=%.2f pct=%.2f%%. "
+                "⛔ Max daily loss truffet (server-dag): drawdown=%.2f (%.2f%%) | grenser: money=%.2f pct=%.2f%%. "
                 "Ingen nye trades i dag.",
                 dd_money, dd_pct, self.max_loss_money, self.max_loss_pct
             )
+            self.locked_for_today = True
+            self._announced = False
+            self._lock_day_key = self._server_day_key(symbol)
             return True
-        return False
 
+        return False
 
 # ---------------------- Historikk / PnL ----------------------
 
@@ -557,11 +616,15 @@ def main() -> int:
             equity = float(ai.equity) if ai and ai.equity else 0.0
             pnl_24h = realized_pnl_last_24h()
             used_risk = current_portfolio_risk_percent()
-            log.info("🕒 Ny bar: %s | close=%.5f | Equity=%.2f | Realisert siste 24t=%.2f | Brukt risiko=%.2f%%",
-                     current_bar_time, last_close, equity, pnl_24h, used_risk)
+            pnl_today_srv = realized_pnl_today_server(symbol)
+            used_risk = current_portfolio_risk_percent()
+            log.info("🕒 Ny bar: %s | close=%.5f | Equity=%.2f | Realisert i dag (server)=%.2f | Brukt risiko=%.2f%%",
+                    current_bar_time, last_close, equity, pnl_today_srv, used_risk)
 
-            # Stopp nye handler hvis max daily loss er truffet
-            if dguard.should_block_new_trades():
+            if dguard.should_block_new_trades(symbol):
+                if not dguard._announced:
+                    logging.getLogger("runner").info("🔒 Daily-loss aktiv – ingen nye trades i dag (server-dag).")
+                    dguard._announced = True
                 time.sleep(poll_sec)
                 continue
 
