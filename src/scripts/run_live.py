@@ -15,38 +15,27 @@ from core.config import settings
 from core.logging import setup_logging
 from broker.mt5_client import MT5Client
 from data.feeds import TIMEFRAME_MAP
-from strategy.breakout_close import BreakoutClose  # AGGRESSIV variant
 from risk.position_sizing import calc_volume_for_risk
 
+from strategy.breakout_close import BreakoutClose  # beholdes for testing
+from strategy.donchian_breakout import DonchianBreakout
 
 # ---------------------- Utils ----------------------
 
 def _server_now(symbol: str) -> datetime:
-    """
-    Returner meglerens servertid basert på siste tick fra symbolet.
-    Faller tilbake til lokal tid hvis tick mangler.
-    """
     tick = mt5.symbol_info_tick(symbol)
     if tick and getattr(tick, "time", None):
-        # MT5-tid er epoch sekunder (UTC). Konverter til naive lokal dt for konsekvent bruk.
         return datetime.fromtimestamp(int(tick.time))
     return datetime.now()
 
 def realized_pnl_today_server(symbol: str) -> float:
-    """
-    Realisert PnL for inneværende kalenderdag etter MEGLERENS servertid.
-    Summerer profit + swap + commission fra dagens midnatt (server) til nå.
-    Restart-sikkert.
-    """
     now_srv = _server_now(symbol)
     day_start_srv = now_srv.replace(hour=0, minute=0, second=0, microsecond=0)
     deals = None
-    # Prøv direkte intervall først
     try:
         deals = mt5.history_deals_get(day_start_srv, now_srv)
     except Exception:
         deals = None
-    # Fallback: history_select hvis tilgjengelig
     if deals is None and hasattr(mt5, "history_select"):
         try:
             if mt5.history_select(day_start_srv, now_srv):
@@ -75,18 +64,13 @@ def resolve_symbol(cli_symbol: Optional[str], strategy_obj) -> str:
     log.warning("Ingen symbol angitt – faller tilbake til %s", fallback)
     return fallback
 
-
 def timeframe_to_mt5(tf_code: str) -> int:
     tf_code = tf_code.upper()
     if tf_code not in TIMEFRAME_MAP:
         raise ValueError(f"Ukjent timeframe: {tf_code}")
     return TIMEFRAME_MAP[tf_code]
 
-
 def fetch_df(symbol: str, tf_const: int, bars: int) -> Optional[pd.DataFrame]:
-    """
-    Hent siste 'bars' candles som DataFrame. Returnerer None ved feil/ingen data.
-    """
     rates = mt5.copy_rates_from_pos(symbol, tf_const, 0, bars)
     if rates is None:
         logging.getLogger("runner").warning("copy_rates_from_pos(%s) ga None. last_error=%s", symbol, mt5.last_error())
@@ -105,22 +89,49 @@ def fetch_df(symbol: str, tf_const: int, bars: int) -> Optional[pd.DataFrame]:
         logging.getLogger("runner").exception("Klarte ikke konvertere rates til DataFrame: %s", e)
         return None
 
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Kjør EA live/paper mot MT5")
+
+    # Driftsvalg
     p.add_argument("--account", type=str, help="Kontoalias eller login (valgfri)")
     p.add_argument("--mode", type=str, choices=["live", "paper"], default="paper", help="Kjør live eller paper")
     p.add_argument("--symbol", type=str, help="Overstyr symbol")
     p.add_argument("--timeframe", type=str, help="Overstyr timeframe (M1,M5,M15,M30,H1,H4,D1...)")
     p.add_argument("--bars", type=int, default=500, help="Antall historiske barer som brukes")
     p.add_argument("--poll", type=float, help="Poll-interval i sekunder (overstyr)")
-    return p.parse_args()
 
+    # Strategivalg
+    p.add_argument(
+        "--strategy",
+        type=str,
+        choices=["donchian_breakout", "breakout_close"],
+        default="donchian_breakout",
+        help="Velg strategi ved oppstart",
+    )
+
+    # Donchian-parameterisering via CLI (valgfritt – brukes kun hvis donchian er valgt)
+    p.add_argument("--lookback", type=int, default=20, help="Donchian lookback (default 20)")
+    p.add_argument("--atr-period", type=int, default=14, help="ATR periode (default 14)")
+    p.add_argument("--rr", type=float, default=3.0, help="Risk/Reward (TP = rr * SL)")
+    p.add_argument(
+        "--ema-filter",
+        type=int,
+        default=200,
+        help="EMA-filter (trend). Bruk 0 for å skru av.",
+    )
+    p.add_argument(
+        "--breakout-mode",
+        type=str,
+        choices=["close", "intra"],
+        default="close",
+        help="Breakout på candle close eller intrabar",
+    )
+
+    return p.parse_args()
 
 # ---------------------- MT5 Init/Login (robust) ----------------------
 
 def _try_mt5client_initialize(mt: MT5Client, account_hint: Optional[str]) -> bool:
-    """Prøv å initialisere MT5Client med account_id fra config."""
     log = logging.getLogger("runner")
 
     if hasattr(mt, "initialize") and callable(getattr(mt, "initialize")):
@@ -141,12 +152,7 @@ def _try_mt5client_initialize(mt: MT5Client, account_hint: Optional[str]) -> boo
     log.info("Ingen init-metode på MT5Client – antar allerede initialisert")
     return True
 
-
 def _raw_mt5_initialize_and_login(account_hint: Optional[str]) -> None:
-    """
-    Fallback: initialiser MetaTrader5 direkte og logg inn hvis vi har creds.
-    Respekterer EA__MT5_PATH dersom satt.
-    """
     log = logging.getLogger("runner")
 
     path = getattr(settings, "mt5_path", None)
@@ -159,7 +165,6 @@ def _raw_mt5_initialize_and_login(account_hint: Optional[str]) -> None:
         if not mt5.initialize():
             raise RuntimeError(f"MetaTrader5.initialize feilet: {mt5.last_error()}")
 
-    # Login hvis vi har credentials
     try:
         acc_id, key_used, password, server = settings.get_login_params(account_hint)
     except Exception:
@@ -177,13 +182,7 @@ def _raw_mt5_initialize_and_login(account_hint: Optional[str]) -> None:
         if info is None:
             log.warning("Ingen konto innlogget, og mangler creds i .env – kjører videre hvis terminal allerede er innlogget.")
 
-
 def init_mt(account_hint: Optional[str]) -> MT5Client:
-    """
-    Robust init som støtter:
-      - MT5Client.initialize() eller .connect()
-      - Ellers raw MetaTrader5.initialize() + login via settings
-    """
     log = logging.getLogger("runner")
     mt = MT5Client()
 
@@ -196,7 +195,6 @@ def init_mt(account_hint: Optional[str]) -> MT5Client:
         log.warning("MT5Client-init feilet (%s) – prøver rå MetaTrader5-init", e)
         _raw_mt5_initialize_and_login(account_hint)
 
-    # Logg terminalstatus
     ti = mt5.terminal_info()
     ai = mt5.account_info()
     if ti:
@@ -208,19 +206,13 @@ def init_mt(account_hint: Optional[str]) -> MT5Client:
 
     return mt
 
-
 # ---------------------- Risiko / posisjoner ----------------------
 
 def has_open_position_count(symbol: str) -> int:
     poss = mt5.positions_get(symbol=symbol)
     return len(poss) if poss else 0
 
-
 def min_stop_distance_ok(symbol: str, entry: float, sl: float) -> bool:
-    """
-    Sjekk brokerens minimum stop-avstand (stops_level).
-    stops_level er i points; min prisavstand = stops_level * point.
-    """
     si = mt5.symbol_info(symbol)
     if si is None:
         return False
@@ -228,23 +220,17 @@ def min_stop_distance_ok(symbol: str, entry: float, sl: float) -> bool:
     stops_points = int(getattr(si, "stops_level", 0) or 0)
     min_dist = stops_points * point
     if min_dist <= 0:
-        return True  # ingen minimum oppgitt
+        return True
     dist = abs(entry - sl)
     return dist >= min_dist
 
-
 def apply_caps(volume: float, risk_fraction: float) -> float:
-    """
-    Cap på maks volum og ev. maks kr-risiko (skalerer volum ned proporsjonalt).
-    """
     vol = float(volume)
 
-    # Volum-cap
     max_vol = float(getattr(settings, "max_volume", 0.0) or 0.0)
     if max_vol > 0.0 and vol > max_vol:
         vol = max_vol
 
-    # Risiko-cap i penger (valgfri)
     max_risk_money = float(getattr(settings, "max_risk_money", 0.0) or 0.0)
     if max_risk_money > 0.0 and risk_fraction > 0.0:
         ai = mt5.account_info()
@@ -256,11 +242,7 @@ def apply_caps(volume: float, risk_fraction: float) -> float:
 
     return max(0.0, vol)
 
-
 def normalize_volume(symbol: str, volume: float) -> float:
-    """
-    Rund volum til nærmeste gyldige step og klem innen min/max iht. broker-regler.
-    """
     si = mt5.symbol_info(symbol)
     if si is None:
         return max(0.0, volume)
@@ -279,11 +261,7 @@ def normalize_volume(symbol: str, volume: float) -> float:
 
     return max(0.0, volume)
 
-
 def _loss_per_lot_if_sl(symbol: str, entry: float, sl: float) -> float:
-    """
-    Estimer PnL-tap pr 1 lot dersom SL treffes (bruker tick_size og tick_value).
-    """
     si = mt5.symbol_info(symbol)
     if not si:
         return 0.0
@@ -294,11 +272,7 @@ def _loss_per_lot_if_sl(symbol: str, entry: float, sl: float) -> float:
     ticks = abs(entry - sl) / tick_size
     return ticks * tick_value
 
-
 def current_portfolio_risk_percent() -> float:
-    """
-    Estimer total %-risiko for alle åpne posisjoner gitt deres SL.
-    """
     ai = mt5.account_info()
     if not ai or not ai.equity:
         return 0.0
@@ -315,16 +289,15 @@ def current_portfolio_risk_percent() -> float:
         total += loss_per_lot * float(p.volume)
     return (total / eq) * 100.0
 
-
 # ---------------------- Daily loss guard ----------------------
 
 class DailyLossGuard:
     def __init__(self, max_loss_pct: float, max_loss_money: float):
-        self.max_loss_pct = float(max_loss_pct or 0.0)    # 0 = av
+        self.max_loss_pct = float(max_loss_pct or 0.0)
         self.max_loss_money = float(max_loss_money or 0.0)
         self.locked_for_today: bool = False
         self._announced: bool = False
-        self._lock_day_key: Optional[str] = None  # "YYYY-MM-DD" for server-dato når låst
+        self._lock_day_key: Optional[str] = None
 
     def _server_day_key(self, symbol: str) -> str:
         dt = _server_now(symbol)
@@ -333,31 +306,24 @@ class DailyLossGuard:
     def _reset_if_new_server_day(self, symbol: str):
         key = self._server_day_key(symbol)
         if self._lock_day_key and self._lock_day_key != key:
-            # Ny dag på server -> lås opp
             self.locked_for_today = False
             self._announced = False
             self._lock_day_key = None
             logging.getLogger("runner").info("📆 Ny server-dag: daily-loss reset.")
 
     def should_block_new_trades(self, symbol: str) -> bool:
-        """
-        Lås når realisert PnL i dag (server-døgn) ≤ -terskel.
-        Terskel = max( max_loss_money, equity * max_loss_pct/100 ).
-        """
         self._reset_if_new_server_day(symbol)
         if self.locked_for_today:
             return True
 
-        # Hvis begge grenser er av -> ingen lås
         if self.max_loss_pct <= 0.0 and self.max_loss_money <= 0.0:
             return False
 
         ai = mt5.account_info()
         equity = float(ai.equity) if ai and ai.equity else 0.0
-        pnl_today = realized_pnl_today_server(symbol)  # negativ ved tap
+        pnl_today = realized_pnl_today_server(symbol)
         dd_money = -pnl_today if pnl_today < 0 else 0.0
 
-        # Beregn terskel i penger
         threshold_money = 0.0
         if self.max_loss_money > 0.0:
             threshold_money = max(threshold_money, self.max_loss_money)
@@ -369,7 +335,7 @@ class DailyLossGuard:
             logging.getLogger("runner").warning(
                 "⛔ Max daily loss truffet (server-dag): drawdown=%.2f (%.2f%%) | grenser: money=%.2f pct=%.2f%%. "
                 "Ingen nye trades i dag.",
-                dd_money, dd_pct, self.max_loss_money, self.max_loss_pct
+                dd_money, dd_pct, self.max_daily_loss_money, self.max_loss_pct
             )
             self.locked_for_today = True
             self._announced = False
@@ -381,10 +347,6 @@ class DailyLossGuard:
 # ---------------------- Historikk / PnL ----------------------
 
 def realized_pnl_last_24h() -> float:
-    """
-    Summerer realisert PnL (profit + swap + commission) for deals siste 24t.
-    Fungerer på MT5-builds uten history_select.
-    """
     end = datetime.now()
     start = end - timedelta(hours=24)
 
@@ -411,7 +373,6 @@ def realized_pnl_last_24h() -> float:
         total += float(getattr(d, "commission", 0.0))
     return total
 
-
 # ---------------------- Order send (robust) ----------------------
 
 def send_market_order(
@@ -424,12 +385,6 @@ def send_market_order(
     tp: Optional[float],
     comment: str,
 ) -> Tuple[bool, Optional[int], Optional[int]]:
-    """
-    Abstraksjon:
-      - Bruk MT5Client.market_order hvis finnes
-      - Ellers raw mt5.order_send
-    Returnerer (ok, order_id, deal_id).
-    """
     log = logging.getLogger("runner")
     if hasattr(mt, "market_order") and callable(getattr(mt, "market_order")):
         return mt.market_order(symbol=symbol, side=side, volume=volume, sl=sl, tp=tp, comment=comment)
@@ -473,12 +428,7 @@ def send_market_order(
 
     return True, getattr(res, "order", None), getattr(res, "deal", None)
 
-
 def adjust_tp_to_exact_2r(symbol: str, side: str, sl: float) -> None:
-    """
-    Etter vellykket ordre: sett TP = fill ± 2R (R = |fill - SL|), basert på faktisk fill/åpen posisjon.
-    Tar hensyn til brokerens min. avstand for TP.
-    """
     log = logging.getLogger("runner")
     poss = mt5.positions_get(symbol=symbol) or []
     if not poss:
@@ -524,15 +474,26 @@ def adjust_tp_to_exact_2r(symbol: str, side: str, sl: float) -> None:
     else:
         log.warning("Kunne ikke oppdatere TP til 2R. Retcode=%s", getattr(mod, "retcode", None))
 
-
 # ---------------------- Hovedprogram ----------------------
 
-def main() -> int:
-    setup_logging()
-    log = logging.getLogger("runner")
-    args = parse_args()
+def build_strategy(args: argparse.Namespace):
+    """
+    Dynamisk strategi-instansiering basert på --strategy.
+    Donchian-parametere tas fra CLI hvis valgt.
+    """
+    if args.strategy == "donchian_breakout":
+        ema_filter = None if (args.ema_filter is not None and int(args.ema_filter) == 0) else int(args.ema_filter)
+        strat = DonchianBreakout(
+            lookback=int(args.lookback),
+            atr_period=int(args.atr_period),
+            rr=float(args.rr),
+            ema_filter=ema_filter,
+            breakout_mode=str(args.breakout_mode),
+            atr_floor_mult=0.0,
+        )
+        return strat
 
-    # Aggressiv strategi
+    # Fallback/alternativ: BreakoutClose beholdes til testing – bruker interne defaults
     strat = BreakoutClose(
         lookback=5,
         swing_lookback=3,
@@ -543,6 +504,16 @@ def main() -> int:
         retest_window=5,
         max_adds=1,
     )
+    return strat
+
+def main() -> int:
+    setup_logging()
+    log = logging.getLogger("runner")
+    args = parse_args()
+
+    # Velg strategi
+    strat = build_strategy(args)
+    log.info("🚀 Running strategy: %s", strat.__class__.__name__)
 
     # Konfig / CLI
     symbol = resolve_symbol(args.symbol, strat)
@@ -610,7 +581,7 @@ def main() -> int:
                 continue
             last_bar_time = current_bar_time
 
-            # Heartbeat: equity + realisert PnL siste 24t + åpen risiko
+            # Heartbeat
             last_close = float(df["close"].iloc[-1])
             ai = mt5.account_info()
             equity = float(ai.equity) if ai and ai.equity else 0.0
@@ -619,7 +590,7 @@ def main() -> int:
             pnl_today_srv = realized_pnl_today_server(symbol)
             used_risk = current_portfolio_risk_percent()
             log.info("🕒 Ny bar: %s | close=%.5f | Equity=%.2f | Realisert i dag (server)=%.2f | Brukt risiko=%.2f%%",
-                    current_bar_time, last_close, equity, pnl_today_srv, used_risk)
+                     current_bar_time, last_close, equity, pnl_today_srv, used_risk)
 
             if dguard.should_block_new_trades(symbol):
                 if not dguard._announced:
@@ -659,20 +630,18 @@ def main() -> int:
             # Strategi-signal
             signal = strat.on_bar(df)
 
-            # Ekstra innsikt når det ikke blir signal
+            # Nøytral "no signal"-logging (ingen interne testreferanser)
             if not signal or signal.side not in ("buy", "sell"):
                 try:
-                    hi, lo = strat._donchian(df)  # samme logikk som strategien
                     close = float(df["close"].iloc[-1])
                     high = float(df["high"].iloc[-1])
                     low = float(df["low"].iloc[-1])
                     logging.getLogger("runner").debug(
-                        "No signal | mode=%s | close=%.5f high=%.5f low=%.5f | donchian_hi=%.5f donchian_lo=%.5f | lb=%d",
-                        getattr(strat, "breakout_mode", "?"), close, high, low, hi, lo, getattr(strat, "lookback", 0)
+                        "No signal | strat=%s | close=%.5f high=%.5f low=%.5f | bars=%d",
+                        strat.__class__.__name__, close, high, low, len(df)
                     )
                 except Exception:
                     pass
-
 
             if signal and signal.side in ("buy", "sell"):
                 try:
@@ -712,7 +681,8 @@ def main() -> int:
                 vol_before = vol
                 vol = apply_caps(vol, risk_fraction)
                 vol = normalize_volume(symbol, vol)
-                log.debug("Volum | beregnet=%.6f | etter_caps=%.6f | normalisert=%.6f", vol_before, apply_caps(vol_before, risk_fraction), vol)
+                log.debug("Volum | beregnet=%.6f | etter_caps=%.6f | normalisert=%.6f",
+                          vol_before, apply_caps(vol_before, risk_fraction), vol)
 
                 if vol <= 0:
                     log.warning("⛔ Volum ble 0 etter caps/normalisering – hopper ordre.")
@@ -766,7 +736,6 @@ def main() -> int:
             pass
 
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
